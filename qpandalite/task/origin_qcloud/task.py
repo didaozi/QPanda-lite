@@ -23,6 +23,10 @@ default_online_config = {
     'task_group_size': 'default_task_group_size'
 }
 
+TASK_STATUS_FAILED = 'failed'
+TASK_STATUS_SUCCESS = 'success'
+TASK_STATUS_RUNNING = 'running'
+
 # Only attempt to read the config file if we're not generating docs
 if os.getenv('SPHINX_DOC_GEN') != '1':
     try:
@@ -37,7 +41,7 @@ if os.getenv('SPHINX_DOC_GEN') != '1':
                           'Cannot load json from the originq_cloud_config.json. '
                           'Please check the content.')
     except Exception as e:
-        raise ImportError('Import origin qcloud  failed.\n'
+        raise ImportError('Import origin qcloud failed.\n'
                           'Unknown import error.'
                           '\n===== Original exception ======\n'
                           f'{traceback.format_exc()}')
@@ -91,7 +95,7 @@ def parse_response_body(response_body):
     task_status = result_list['taskStatus']
     if task_status == '3':
         # successfully finished !
-        ret['status'] = 'success'
+        ret['status'] = TASK_STATUS_SUCCESS
 
         # task_result
         task_result = result_list['taskResult']
@@ -105,12 +109,12 @@ def parse_response_body(response_body):
         ret['result'] = task_result
         return ret
     elif task_status == '4':
-        ret['status'] = 'failed'
+        ret['status'] = TASK_STATUS_FAILED
         ret['result'] = {'errcode': result_list['errorDetail'], 'errinfo': result_list['errorMessage']}
 
         return ret
     else:
-        ret['status'] = 'running'
+        ret['status'] = TASK_STATUS_RUNNING
         return ret
 
 
@@ -179,21 +183,23 @@ def query_by_taskid_single(taskid: str,
     response_body = json.loads(text)
     taskinfo = parse_response_body(response_body)
     
-    if savepath and taskinfo['status'] == 'success':
-        with open(filename, 'w') as fp:
-            json.dump(taskinfo, fp)
+    if savepath and (taskinfo['status'] == TASK_STATUS_SUCCESS or 
+                     taskinfo['status'] == TASK_STATUS_FAILED):
+        write_taskinfo(taskid, taskinfo, savepath)
 
     return taskinfo
 
 
 def query_by_taskid(taskid: Union[List[str], str],
                     url=default_query_url,
+                    savepath=Path.cwd() / 'online_info',
                     **kwargs):
     '''Query circuit status by taskid (Async). This function will return without waiting.
 
     Args:
         taskid (str): The taskid.
         url (str, optional): The querying URL. Defaults to default_query_url.
+        savepath (PathLikeObject, optional): The savepath. Defaults to Path.cwd() / 'online_info'
 
     Raises:
         ValueError: Taskid invalid.
@@ -211,25 +217,24 @@ def query_by_taskid(taskid: Union[List[str], str],
 
     if isinstance(taskid, list):
         taskinfo = dict()
-        taskinfo['status'] = 'success'
+        taskinfo['status'] = TASK_STATUS_SUCCESS
         taskinfo['result'] = []
         for taskid_i in taskid:
-            taskinfo_i = query_by_taskid_single(taskid_i, url)
-            # print(taskinfo_i)
-            if taskinfo_i['status'] == 'failed':
+            taskinfo_i = query_by_taskid_single(taskid_i, url, savepath)
+            if taskinfo_i['status'] == TASK_STATUS_FAILED:
                 # if any task is failed, then this group is failed.
-                taskinfo['status'] = 'failed'
+                taskinfo['status'] = TASK_STATUS_FAILED
                 break
-            elif taskinfo_i['status'] == 'running':
+            elif taskinfo_i['status'] == TASK_STATUS_RUNNING:
                 # if any task is running, then set to running
-                taskinfo['status'] = 'running'
-            if taskinfo_i['status'] == 'success':
-                if taskinfo['status'] == 'success':
+                taskinfo['status'] = TASK_STATUS_RUNNING
+            if taskinfo_i['status'] == TASK_STATUS_SUCCESS:
+                if taskinfo['status'] == TASK_STATUS_SUCCESS:
                     # update if task is successfully finished (so far)
                     taskinfo['result'].extend(taskinfo_i['result'])
 
     elif isinstance(taskid, str):
-        taskinfo = query_by_taskid_single(taskid, url)
+        taskinfo = query_by_taskid_single(taskid, url, savepath)
     else:
         raise ValueError('Invalid Taskid')
     
@@ -241,12 +246,16 @@ def query_by_taskid_sync(taskid,
                          timeout=60.0,
                          retry=5,
                          url=default_query_url,
+                         savepath=None,
                          **kwargs):
     '''Query circuit status by taskid (synchronous version), it will wait until the task finished.
 
     Args:
         taskid (str): The taskid.
         interval (float): Interval time between two queries. (in seconds)
+        timeout (float): The timeout for this synchronized query
+        retry (int): The number of retries.
+        savepath (PathLikeObject): The path for saving cached results.
         url (str, optional): The querying URL. Defaults to default_query_url.
 
     Raises:
@@ -267,22 +276,22 @@ def query_by_taskid_sync(taskid,
 
             time.sleep(interval)
 
-            taskinfo = query_by_taskid(taskid, url)
-            if taskinfo['status'] == 'running':
+            taskinfo = query_by_taskid(taskid, url, savepath)
+            if taskinfo['status'] == TASK_STATUS_RUNNING:
                 continue
-            if taskinfo['status'] == 'success':
+            if taskinfo['status'] == TASK_STATUS_SUCCESS:
                 result = taskinfo['result']
                 return result
-            if taskinfo['status'] == 'failed':
+            if taskinfo['status'] == TASK_STATUS_FAILED:
                 errorinfo = taskinfo['result']
                 raise RuntimeError(f'Failed to execute, errorinfo = {errorinfo}')
-        except RuntimeError as e:
+        except Exception as e:
             if retry > 0:
                 retry -= 1
-                print(f'Query failed. Retry remains {retry} times.')
+                warnings.warn(f'Query failed. Retry remains {retry} times.')
             else:
-                print(f'Retry count exhausted.')
-                raise e
+                raise RuntimeError('Query failed. Retry count exhausted'
+                                   f'Original exception is {e}')
 
 
 def _submit_task_group(circuits=None,
@@ -296,6 +305,8 @@ def _submit_task_group(circuits=None,
                        compile_only=False,
                        specified_block=None,
                        url=default_submit_url,
+                       timeout=30,
+                       retry=5,
                        savepath=Path.cwd() / 'online_info'
                        ):
     '''submit taskgroup
@@ -312,6 +323,7 @@ def _submit_task_group(circuits=None,
         compile_only (bool, optional): Only compile time sequence data, without really executing it. Defaults to False.
         specified_block (int, optional): The specified block on chip. Defaults to None. (Note: reserved field.)
         url (str, optional): The URL for submitting the task. Defaults to default_submit_url.
+        timeout (float, optional): The timeout for submitting each task (passed to request.post)
         savepath (str, optional): str. Defaults to Path.cwd()/'online_info'. If None, it will not save the task info.
 
     Raises:
@@ -334,18 +346,18 @@ def _submit_task_group(circuits=None,
         if group:
             groups.append(group)
 
-        return [_submit_task_group(group,
-                                   '{}_{}'.format(task_name, i),
-                                   tasktype,
-                                   chip_id,
-                                   shots,
-                                   circuit_optimize,
-                                   measurement_amend,
-                                   auto_mapping,
-                                   compile_only,
-                                   specified_block,
-                                   url,
-                                   savepath) for i, group in enumerate(groups)]
+        return [_submit_task_group(circuits=group,
+                                   task_name='{}_{}'.format(task_name, i),
+                                   tasktype=tasktype,
+                                   chip_id=chip_id,
+                                   shots=shots,
+                                   circuit_optimize=circuit_optimize,
+                                   measurement_amend=measurement_amend,
+                                   auto_mapping=auto_mapping,
+                                   compile_only=compile_only,
+                                   specified_block=specified_block,
+                                   url=url,
+                                   savepath=savepath) for i, group in enumerate(groups)]
 
         # raise RuntimeError(f'Circuit group size too large. '
         #                    f'(Expect: <= {default_task_group_size}, Get: {len(circuits)})')
@@ -368,15 +380,27 @@ def _submit_task_group(circuits=None,
     request_body['circuitOptimization'] = 1 if circuit_optimize else 0
     request_body['compileLevel'] = 3
 
-    response = requests.post(url=url,
-                             headers=headers,
-                             json=request_body,
-                             verify=False,
-                             timeout=10)
-    status_code = response.status_code
-    if status_code != 200:
-        raise RuntimeError(f'Error in submit_task. The returned status code is not 200.'
-                           f' Response: {response.text}')
+    while True:
+        try:
+            response = requests.post(url=url,
+                                    headers=headers,
+                                    json=request_body,
+                                    verify=False,
+                                    timeout=timeout)
+            status_code = response.status_code
+            if status_code != 200:
+                raise RuntimeError(f'Error in submit_task. The returned status code is not 200.'
+                                f' Response: {response.text}')
+
+            break
+        except Exception as e:
+            if retry > 0:
+                retry -= 1
+                warnings.warn(f'submit_task failed (possibly due to network issue). Retry remains {retry} times.')
+                time.sleep(1)
+            else:
+                raise RuntimeError( 'submit_task failed. Retry count exhausted. '
+                                   f'Original exception is {e}')
 
     try:
         text = response.text
@@ -425,6 +449,10 @@ def submit_task(
         url (str, optional): The URL for submitting the task. Defaults to default_submit_url.
         savepath (str, optional): str. Defaults to Path.cwd()/'online_info'. If None, it will not save the task info.
 
+    Optional kwargs:
+        timeout (float, optional): Timeout option for submitting task. Defaults to 30.
+        retry (int, optional): Retry count for submitting task. Defaults to 5.
+
     Raises:
         RuntimeError: Circuit not input
         RuntimeError: Error when submitting the task
@@ -450,7 +478,8 @@ def submit_task(
             compile_only=False,
             specified_block=specified_block,
             url=url,
-            savepath=savepath
+            savepath=savepath,
+            **kwargs
         )
     elif isinstance(circuit, str):
         taskid = _submit_task_group(
@@ -465,7 +494,8 @@ def submit_task(
             compile_only=False,
             specified_block=specified_block,
             url=url,
-            savepath=savepath
+            savepath=savepath,            
+            **kwargs
         )
     else:
         raise ValueError('Input must be a str or List[str], where each str is a valid originir string.')
@@ -479,7 +509,7 @@ def submit_task(
     return taskid
 
 
-def query_all_task(url=default_query_url, savepath=None, **kwargs):
+def query_all_tasks(url=default_query_url, savepath=None, **kwargs):
     '''Query all task info in the savepath. If you only want to query from taskid, then you can use query_by_taskid instead.
 
     Args:
@@ -503,7 +533,7 @@ def query_all_task(url=default_query_url, savepath=None, **kwargs):
             for taskid_i in taskid:
                 if not os.path.exists(savepath / '{}.txt'.format(taskid)):
                     taskinfo = query_by_taskid(taskid_i, url)
-                    if taskinfo['status'] == 'success' or taskinfo['status'] == 'failed':
+                    if taskinfo['status'] == TASK_STATUS_SUCCESS or taskinfo['status'] == TASK_STATUS_FAILED:
                         write_taskinfo(taskid_i, taskinfo, savepath)
                     else:
                         status = 'unfinished'
@@ -513,7 +543,7 @@ def query_all_task(url=default_query_url, savepath=None, **kwargs):
         elif isinstance(taskid, str):
             if not os.path.exists(savepath / '{}.txt'.format(taskid)):
                 taskinfo = query_by_taskid(taskid, url)
-                if taskinfo['status'] == 'success' or taskinfo['status'] == 'failed':
+                if taskinfo['status'] == TASK_STATUS_SUCCESS or taskinfo['status'] == TASK_STATUS_FAILED:
                     write_taskinfo(taskid, taskinfo, savepath)
                     finished += 1
             else:
@@ -522,6 +552,11 @@ def query_all_task(url=default_query_url, savepath=None, **kwargs):
             raise RuntimeError('Invalid Taskid.')
     return finished, task_count
 
+def query_all_task(url=default_query_url, savepath=None, **kwargs):
+    '''Deprecated!! Use query_all_tasks instead
+    '''
+    warnings.warn(DeprecationWarning("Use query_all_tasks instead"))
+    return query_all_tasks(url, savepath, **kwargs)
 
 if __name__ == '__main__':
     result = query_by_taskid_single("55775D4858EF3D2C3813945703243A01")
